@@ -4,6 +4,40 @@
 
 The architecture: token embeddings + positional embeddings → one Transformer block (causal self-attention → FFN, both with residual connections and layer norm) → linear projection to vocabulary logits. Training builds (prefix, next_token) pairs from each sequence, left-pads prefixes to `max_len`, and optimizes cross-entropy loss.
 
+
+## Running
+
+source ~/vllm-env/bin/activate
+
+# Default settings
+python tiny_decoder.py
+
+# All available options
+python tiny_decoder.py \
+  --max-len 10 \      # Maximum context length (default: 10)
+  --d-model 32 \      # Embedding/hidden dimension (default: 32)
+  --d-ff 64 \         # Feed-forward inner dimension (default: 64)
+  --n-heads 1 \       # Number of attention heads (default: 1)
+  --epochs 600 \      # Training epochs (default: 600)
+  --lr 0.03 \         # Learning rate (default: 3e-2)
+  --seed 42           # Random seed (default: 42)
+
+## Some useful options
+
+# Longer context, more training
+python tiny_decoder.py --max-len 16 --epochs 1000
+
+# Wider model with multi-head attention
+python tiny_decoder.py --d-model 64 --d-ff 128 --n-heads 4
+
+# Quick iteration
+python tiny_decoder.py --epochs 100
+
+# Reproducibility check — change seed
+python tiny_decoder.py --seed 123
+
+Note that --d-model must be divisible by --n-heads, and --max-len must be ≥ 5 (the length of the longest training sequence).
+
 ---
 
 ## Annotated Function List
