@@ -117,7 +117,8 @@ def test_no_future_leak() -> None:
     base = torch.tensor([[tok.bos_id, 3, 4, 5, 0, 0, 0, 0]])
     perturbed = base.clone()
     # Change only positions 5..7 (the "future" relative to position 4).
-    perturbed[0, 5:] = torch.tensor([6, 7, 6])
+    # Values must stay within vocab range (here 0..5).
+    perturbed[0, 5:] = torch.tensor([5, 4, 3])
 
     with torch.no_grad():
         l_base = model(base)[0, :5]
