@@ -1,10 +1,70 @@
 ## Overview
 
-`tiny_decoder.py` is a minimal decoder-only Transformer that implements the same block pattern used by GPT-2 and GPT-3 exactly, and shares the same pre-norm decoder structure as Llama and Mistral (which substitute different primitives — RMSNorm, SwiGLU, RoPE, GQA — within that structure). It trains a next-token prediction objective on a small structured dataset, then demonstrates three distinct generation behaviours: memorisation, compositional generalisation, and distributional sampling. The entire pipeline — tokenisation, dataset construction, model definition, training loop, generation — is self-contained in one file with no external dependencies beyond PyTorch. The vocabulary is 14 tokens (11 words plus `<pad>`, `<bos>`, `<eos>`); the default depth is 2 blocks.
+`tiny_decoder.py` is a minimal decoder-only Transformer that implements the same block pattern used by GPT-2 and GPT-3 exactly, and shares the same pre-norm decoder structure as Llama and Mistral (which substitute different primitives — RMSNorm, SwiGLU, RoPE, GQA — within that structure). It is explicitly designed as an **architecture explainer**. The goal of this file is to allow an engineer to read and understand every component of a modern large language model (LLM) in a single sitting without getting bogged down by the engineering complexities of production training frameworks (like `vLLM` or `nanoGPT`).
+It trains a next-token prediction objective on a small structured dataset, then demonstrates three distinct generation behaviours: memorisation, compositional generalisation, and distributional sampling. The entire pipeline — tokenisation, dataset construction, model definition, training loop, generation — is self-contained in one file with no external dependencies beyond PyTorch. The vocabulary is 14 tokens (11 words plus `<pad>`, `<bos>`, `<eos>`); the default depth is 2 blocks.
 
 The architecture: token embeddings + learned positional embeddings → N pre-norm Transformer blocks (causal multi-head self-attention → GELU FFN, both with residual connections and LayerNorm) → final LayerNorm → tied linear projection to vocabulary logits. Training shifts inputs by one position to produce targets, supervises every position in a single forward pass, and uses `-100` (IGNORE_INDEX) in padded target slots so cross-entropy ignores them with no manual masking.
 
 The dataset encodes a single rule — *the verb determines the object class, independent of the subject* — so the three generation demos at the bottom of `main()` each probe a different capability: rote recall, compositional generalisation, and distributional sampling.
+
+## What it is
+
+Despite being "tiny," it makes the exact same structural choices as modern frontier models (like GPT-2, GPT-4, Llama 3, and Mistral). It features:
+*   **Pre-norm Transformer blocks:** LayerNorm is applied before Attention and Feed-Forward Networks.
+*   **GELU activations:** The modern choice over ReLU.
+*   **Tied embeddings:** The input token embedding weights are shared with the final vocabulary projection (`lm_head`).
+*   **Parameter-group weight decay:** Excludes biases and LayerNorm parameters from L2 regularization (AdamW).
+*   **GPT-2 style residual initialization scaling:** Prevents variance from exploding in the residual stream as depth increases.
+
+It explicitly sacrifices production optimizations (like KV caching, FlashAttention, or DataLoader mini-batching) in favor of readable, step-by-step PyTorch mathematical operations.
+
+## What it does
+The script trains this tiny neural network on a toy dataset to demonstrate that the architecture can learn complex rules and probability distributions, not just rote memorization. 
+
+The dataset is an 11-word vocabulary containing 12 short sentences. The sentences encode a specific rule: **the verb determines the object class, independent of the subject.**
+*   `like` or `feed` -> pets (`cats`, `dogs`)
+*   `see` -> wildlife (`birds`, `fish`)
+
+When you run the script, it:
+1.  **Tokenizes** the text into integer IDs using a custom word-level `TinyTokenizer`.
+2.  **Builds training tensors**, aligning inputs with "next-token" targets (shifted by one).
+3.  **Trains the model** for 1,500 epochs (by default) using full-batch gradient descent.
+4.  **Generates text** to prove the model learned the underlying rules. It tests this in three ways:
+    *   **Memorized:** Prompts seen exactly in training (e.g., `I see` -> `birds`).
+    *   **Compositional:** Prompts with subject-verb combinations never seen in training (e.g., `we like` -> `cats`). This proves the model generalized the verb rule to novel contexts.
+    *   **Distributional:** Evaluates sampling (temperature=1.0) to show the model learned a 50/50 probability distribution (e.g., `I like` yields a mix of `cats` and `dogs` across multiple samples).
+
+## How it works (Stage by Stage)
+
+### 1. Data Preparation and Shifted Targets
+The `build_dataset` function transforms integer sequences into the standard autoregressive language modeling format:
+*   `inputs`: The sequence without the last token (right-padded).
+*   `targets`: The sequence without the first token (shifted left by one).
+The model uses right-padding with a special `IGNORE_INDEX` (-100) for targets. PyTorch's `F.cross_entropy` loss function natively ignores any target with a value of -100, meaning the model is only penalized for predictions on actual tokens, gracefully ignoring the padding without requiring complex manual loss masks.
+
+### 2. The Model Architecture (`TinyDecoder`)
+The `TinyDecoder` class acts as the orchestrator:
+*   **Embeddings:** It takes token IDs, maps them to dense vectors (`nn.Embedding`), and adds learned absolute positional embeddings so the model knows the order of the words.
+*   **Causal Mask:** It registers a single lower-triangular boolean mask (`torch.tril`) as a buffer. This mask is threaded into the blocks to physically prevent the attention mechanism from "looking into the future" at tokens it hasn't generated yet.
+*   **Transformer Blocks:** The input passes through `N` stacked `TransformerBlock` modules. Each block contains:
+    *   **Causal Self-Attention:** Projects the input into Queries (Q), Keys (K), and Values (V). It calculates attention scores via scaled dot-product (`(Q @ K.T) / sqrt(d_k)`), applies the causal mask (setting future positions to `-inf`), runs them through softmax, and multiplies by V.
+    *   **Feed-Forward Network (FFN):** An expansion layer (`d_model -> d_ff -> d_model`) using a GELU activation function. This is where the model does its factual "pattern matching".
+*   **Output Head:** Finally, the sequence goes through a LayerNorm and a final Linear projection (`lm_head`) to map the dense vectors back into logits (raw scores) representing the probabilities of the 11 words in the vocabulary. 
+
+### 3. The Training Loop
+The script uses standard PyTorch Autograd. It sets up an `AdamW` optimizer, but uses a helper function `_build_optimizer` to split the parameters: it avoids applying weight decay to 1D parameters (like biases and LayerNorm weights) to ensure training stability. 
+In the `train` function, it does a full-batch forward pass, calculates Cross-Entropy loss over the flattened batch and time dimensions, runs `loss.backward()`, clips gradients (`grad_clip = 1.0`), and steps the optimizer.
+
+### 4. Autoregressive Generation
+The `generate` function demonstrates how LLMs actually "type." It works in a loop:
+1.  Takes the current prompt and converts it to tensor IDs.
+2.  Runs a full forward pass on the context.
+3.  Slices out the logits for the *very last* token position.
+4.  Applies a `temperature` scale (and optional `top_k` masking).
+5.  Samples the next token ID from the resulting Softmax distribution using `torch.multinomial` (or `argmax` if greedy/temperature is 0).
+6.  Appends this single token to the prompt, and repeats the entire process until it hits the `<eos>` token or the max token limit.
+
+Because it lacks a KV-Cache, the model redundantly recomputes the Keys and Values for the entire prefix context every single step (making generation $O(T^2)$ time complexity).
 
 ## Running
 
