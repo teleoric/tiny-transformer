@@ -1,10 +1,10 @@
 ## Overview
 
-`tiny_decoder.py` is a minimal decoder-only Transformer that implements the same architecture pattern used by GPT-2, GPT-3/4, Llama, and Mistral — scaled down to a couple of blocks and an eleven-word vocabulary. It trains a next-token prediction objective on a small structured dataset, then demonstrates three distinct generation behaviours (memorisation, composition, distribution). The entire pipeline — tokenisation, dataset construction, model definition, training loop, generation — is self-contained in one file with no external dependencies beyond PyTorch.
+`tiny_decoder.py` is a minimal decoder-only Transformer that implements the same block pattern used by GPT-2 and GPT-3 exactly, and shares the same pre-norm decoder structure as Llama and Mistral (which substitute different primitives — RMSNorm, SwiGLU, RoPE, GQA — within that structure). It trains a next-token prediction objective on a small structured dataset, then demonstrates three distinct generation behaviours: memorisation, compositional generalisation, and distributional sampling. The entire pipeline — tokenisation, dataset construction, model definition, training loop, generation — is self-contained in one file with no external dependencies beyond PyTorch. The vocabulary is 14 tokens (11 words plus `<pad>`, `<bos>`, `<eos>`); the default depth is 2 blocks.
 
 The architecture: token embeddings + learned positional embeddings → N pre-norm Transformer blocks (causal multi-head self-attention → GELU FFN, both with residual connections and LayerNorm) → final LayerNorm → tied linear projection to vocabulary logits. Training shifts inputs by one position to produce targets, supervises every position in a single forward pass, and uses `-100` (IGNORE_INDEX) in padded target slots so cross-entropy ignores them with no manual masking.
 
-The dataset encodes a single rule — *the verb determines the object class, independent of the subject* — so the three generation demos at the bottom of `main()` exercise distinct capabilities rather than rote regurgitation.
+The dataset encodes a single rule — *the verb determines the object class, independent of the subject* — so the three generation demos at the bottom of `main()` each probe a different capability: rote recall, compositional generalisation, and distributional sampling.
 
 ## Running
 
@@ -35,7 +35,8 @@ Constraints: `--d-model` must be divisible by `--n-heads`; `--max-len` must be �
 ### Useful variations
 
 ```bash
-# Deeper, wider model — exercises residual init scaling and multi-head attention
+# Deeper, wider model — the residual init scaling (std = 0.02/sqrt(2·n_layers))
+# only meaningfully affects training stability once n_layers grows; try here.
 python tiny_decoder.py --n-layers 4 --d-model 128 --d-ff 512 --n-heads 8
 
 # Quick iteration during development
@@ -54,7 +55,16 @@ python tiny_decoder.py --weight-decay 0.01
 pytest tests/
 ```
 
-Pins shape, causality (no-future-leak), and dataset shift alignment. Fast — runs in well under a second on CPU.
+Covers:
+
+- **Shape**: forward pass on full-length input returns `[B, T, vocab_size]`.
+- **Variable-T inference**: the same model handles inputs shorter than `max_len` without re-sizing buffers.
+- **Length rejection**: inputs exceeding `max_len` raise `ValueError` instead of silently truncating.
+- **No future leak**: perturbing input positions `t+1..T-1` leaves logits at positions `0..t` bit-identical — the causality guarantee on which the next-token objective depends.
+- **Dataset shift alignment**: for a length-L sequence, `targets[0..L-3] == inputs[1..L-2]` and pad slots contain `IGNORE_INDEX`.
+- **Config validation**: two checks confirming `__post_init__` rejects `d_model % n_heads != 0` and out-of-range `dropout`.
+
+Fast — runs in well under a second on CPU.
 
 ---
 
@@ -88,9 +98,9 @@ Pins shape, causality (no-future-leak), and dataset shift alignment. Fast — ru
 
 ### Model Components
 
-**`CausalSelfAttention(d_model, n_heads, dropout)`** — Multi-head scaled dot-product attention with separate Q/K/V/output projections (bias-free, GPT-2/Llama style). The causal mask is *not* owned here — it's passed in from the top-level model, so multi-layer stacks don't duplicate the buffer. Attention and residual dropout applied per nanoGPT.
+**`CausalSelfAttention(d_model, n_heads, dropout)`** — Multi-head scaled dot-product attention with separate Q/K/V/output projections, bias-free (Llama style; GPT-2 itself kept biases on these). The causal mask is *not* owned here — it's passed in from the top-level model, so multi-layer stacks don't duplicate the buffer. Attention and residual dropout applied per nanoGPT.
 
-**`FeedForward(d_model, d_ff, dropout)`** — Two-layer MLP, `d_model → d_ff → d_model` with GELU activation and post-projection dropout. Modern production models often use SwiGLU; GELU is GPT-2's choice and one fewer unfamiliar primitive.
+**`FeedForward(d_model, d_ff, dropout)`** — Two-layer MLP, `d_model → d_ff → d_model` with GELU activation and post-projection dropout. Linear layers are biased here (GPT-2 convention). Modern production models often use SwiGLU; GELU is one fewer unfamiliar primitive.
 
 **`TransformerBlock(cfg)`** — Pre-norm decoder block: `x + attn(LN(x))` then `x + ffn(LN(x))`. Pre-norm (LN before each sub-layer) is the GPT-2 / Llama variant and is materially more stable to train at depth than the original post-norm formulation.
 
@@ -98,13 +108,13 @@ Pins shape, causality (no-future-leak), and dataset shift alignment. Fast — ru
 
 - **Weight tying**: `lm_head.weight = token_emb.weight` halves embedding parameters and tends to improve generalisation (toggle with `--no-tie-embeddings`).
 - **Shared causal mask**: registered once as a non-persistent buffer on the top-level module, threaded through each block — no per-layer duplication.
-- **GPT-2 residual init scaling**: weights of the residual-stream exit projections (`out_proj`, `fc2`) are initialised with std `0.02 / sqrt(2 * n_layers)`, so the residual stream variance stays O(1) as depth grows.
+- **GPT-2 residual init scaling**: weights of the residual-stream exit projections (`out_proj`, `fc2`) are initialised with std `0.02 / sqrt(2 · n_layers)`, so the residual stream variance stays O(1) as depth grows. The effect is negligible at `n_layers=2` and becomes important past 4–6.
 
 ### Training
 
-**`_build_optimizer(model, cfg)`** — AdamW with parameter-group weight decay. 2D+ tensors (Linear/Embedding weights) go into the decay group; biases and LayerNorm scale/shift (all 1D) go into a no-decay group. This is the GPT-2/nanoGPT convention — applying L2 to LN affine params hurts training.
+**`_build_optimizer(model, cfg)`** — AdamW with parameter-group weight decay. 2D+ tensors (Linear/Embedding weights) go into the decay group; biases and LayerNorm scale/shift (all 1D) go into a no-decay group. This is the GPT-2/nanoGPT convention — applying L2 to LN affine params hurts training. Tied embeddings are returned once by `named_parameters()` so they land in the decay group exactly once.
 
-**`train(model, inputs, targets, device, cfg)`** — Full-batch training loop. AdamW, cross-entropy with `ignore_index=IGNORE_INDEX`, optional grad-norm clipping. Logs loss and a mask-aware accuracy every 100 epochs.
+**`train(model, inputs, targets, device, cfg)`** — Full-batch training loop. AdamW, cross-entropy with `ignore_index=IGNORE_INDEX`, optional grad-norm clipping. Logs loss and a mask-aware accuracy at epoch 1, every 100 epochs, and the final epoch.
 
 ### Generation
 
