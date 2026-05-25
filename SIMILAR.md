@@ -2,7 +2,7 @@ Three recommendations, each at a different point on the simplicity-to-production
 
 ### 1. nanoGPT — Best for Learning
 
-Andrej Karpathy's implementation. Single-file GPT-2 training that's readable end-to-end. Your `tiny_decoder.py` is structurally very close to this — stepping up to nanoGPT is a natural progression.
+Andrej Karpathy's implementation. Single-file GPT-2 training that's readable end-to-end. Your `tiny_decoder.py` is now structurally aligned with nanoGPT — same pre-norm blocks, GELU, tied embeddings, GPT-2 residual init scaling, parameter-group weight decay, shifted-target training, and shared causal mask. Stepping up to nanoGPT primarily means: a real BPE tokenizer (tiktoken), a KV cache for fast generation, mini-batched training with a DataLoader, mixed precision, and a non-trivial dataset.
 
 - ~300 lines of core model code
 - Trains GPT-2 124M on OpenWebText, scales to 350M+
@@ -56,7 +56,7 @@ litgpt pretrain --config pythia-160m  # start small
 
 ### What I'd Actually Do
 
-Start with **nanoGPT** — read it, understand every line, modify it. It's the closest thing to a production-readable `tiny_decoder.py`. Train a 124M GPT-2 on your 7900 XT to validate the full pipeline works on ROCm. Then scale to 300M by adjusting `n_layer`, `n_head`, `n_embd` in the config.
+Start with **nanoGPT** — read it, understand every line, modify it. It's the closest thing to a production-readable `tiny_decoder.py` and the diff between the two is largely about scale, tokenization, and engineering polish (KV cache, mini-batching, mixed precision) rather than architecture. Train a 124M GPT-2 on your 7900 XT to validate the full pipeline works on ROCm. Then scale to 300M by adjusting `n_layer`, `n_head`, `n_embd` in the config.
 
 Once you've internalized the training mechanics, move to **torchtune** for fine-tuning real models (Llama 8B with LoRA) — that's where the practical value lands for your RAG platform.
 
